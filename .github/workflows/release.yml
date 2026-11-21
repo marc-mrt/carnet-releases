@@ -1,0 +1,108 @@
+name: release
+
+# Builds Carnet from the private repository marc-mrt/poste at a tag and
+# publishes it here. Started by hand only:
+#   gh workflow run release -R marc-mrt/carnet-releases -f tag=vX.Y.Z
+# Never add a pull_request_target trigger: it would hand POSTE_READ_TOKEN to
+# code from forks.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of marc-mrt/poste to build (vX.Y.Z)
+        required: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  flatpak:
+    name: Build Flatpak
+    # The binary is built on the host and must not need a newer glibc than the
+    # org.gnome.Platform runtime; bump together with runtime-version.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      # The source, at the tag, at the workspace root so its local actions
+      # and paths resolve. Full history: the notes need the previous tag.
+      - uses: actions/checkout@v7
+        with:
+          repository: marc-mrt/poste
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.POSTE_READ_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          shared-key: release
+
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: "1.4.4"
+
+      - run: bun install --frozen-lockfile
+
+      # The repo carries the version; a mismatched tag fails rather than
+      # shipping a version no commit has.
+      - name: Check version matches tag
+        run: bash scripts/release/check-version.sh "$TAG"
+
+      # Notes from the pull requests merged since the previous tag, for the
+      # release and for the metainfo's <release> entry the bundle ships.
+      - name: Release notes
+        run: |
+          bash scripts/release/notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
+          bash scripts/release/metainfo-notes.sh "$TAG" "$(date -u +%F)" apps/client/flatpak/io.github.marc_mrt.Poste.metainfo.xml < "$RUNNER_TEMP/notes.md"
+
+      - name: Build binary
+        working-directory: apps/client
+        run: bash scripts/tauri-build.sh --no-bundle
+
+      # Start the binary the bundle ships once and drive a sign-in, read and
+      # send before anything is published.
+      - name: Install Dovecot, WebKitWebDriver and Xvfb
+        run: |
+          sudo apt-get install -y dovecot-imapd webkit2gtk-driver xvfb dbus
+          sudo systemctl stop dovecot || true
+
+      - name: Install tauri-driver
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-driver
+
+      - name: Start the built binary
+        run: POSTE_BINARY="$PWD/target/release/poste" bash tests/driver/run.sh
+
+      - name: Install flatpak tooling
+        run: |
+          sudo apt-get install -y flatpak flatpak-builder appstream
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Validate metainfo
+        run: appstreamcli validate --strict --no-net apps/client/flatpak/io.github.marc_mrt.Poste.metainfo.xml
+
+      - name: Build Flatpak bundle
+        run: |
+          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir apps/client/flatpak/io.github.marc_mrt.Poste.yml
+          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo carnet.flatpak io.github.marc_mrt.Poste
+          sha256sum carnet.flatpak > SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: carnet.flatpak
+
+      # Created only now, so a failed build leaves no empty release behind.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" carnet.flatpak SHA256SUMS -R "$GITHUB_REPOSITORY" --title "Carnet ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"
