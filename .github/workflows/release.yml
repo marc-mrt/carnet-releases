@@ -1,6 +1,6 @@
 name: release
 
-# Builds Carnet from the private repository marc-mrt/poste at a tag and
+# Builds Carnet from the private repository marc-mrt/carnet at a tag and
 # publishes it here. Started by hand only:
 #   gh workflow run release -R marc-mrt/carnet-releases -f tag=vX.Y.Z
 # Never add a pull_request_target trigger: it would hand CARNET_READ_TOKEN to
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag of marc-mrt/poste to build (vX.Y.Z)
+        description: Tag of marc-mrt/carnet to build (vX.Y.Z)
         required: true
 
 concurrency:
@@ -36,7 +36,7 @@ jobs:
       # and paths resolve. Full history: the notes need the previous tag.
       - uses: actions/checkout@v7
         with:
-          repository: marc-mrt/poste
+          repository: marc-mrt/carnet
           ref: ${{ inputs.tag }}
           token: ${{ secrets.CARNET_READ_TOKEN }}
           fetch-depth: 0
