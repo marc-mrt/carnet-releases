@@ -3,7 +3,7 @@ name: release
 # Builds Carnet from the private repository marc-mrt/poste at a tag and
 # publishes it here. Started by hand only:
 #   gh workflow run release -R marc-mrt/carnet-releases -f tag=vX.Y.Z
-# Never add a pull_request_target trigger: it would hand POSTE_READ_TOKEN to
+# Never add a pull_request_target trigger: it would hand CARNET_READ_TOKEN to
 # code from forks.
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ jobs:
         with:
           repository: marc-mrt/poste
           ref: ${{ inputs.tag }}
-          token: ${{ secrets.POSTE_READ_TOKEN }}
+          token: ${{ secrets.CARNET_READ_TOKEN }}
           fetch-depth: 0
           persist-credentials: false
 
