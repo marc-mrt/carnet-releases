@@ -79,7 +79,7 @@ jobs:
           sha256sum carnet-android-arm64.apk > SHA256SUMS
           echo "sha=$(git -C carnet rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           # The certificate the APK was signed with, as users see it.
-          cert=$(keytool -list -v -keystore "$KEYSTORE" -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" | sed -n 's/^ *SHA256: *//p' | head -n 1)
+          cert=$(keytool -list -v -keystore "$KEYSTORE" -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" | sed -n 's/^[[:space:]]*SHA256: *//p' | head -n 1)
           [ -n "$cert" ] || { echo "::error::no certificate digest for the key alias"; exit 1; }
           echo "cert=$cert" >> "$GITHUB_OUTPUT"
 
