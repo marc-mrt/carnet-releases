@@ -1,0 +1,117 @@
+name: android
+
+# Builds a signed, sideloadable arm64 APK of the private repository
+# marc-mrt/carnet at any ref and publishes it here as a prerelease. Started by
+# hand only:
+#   gh workflow run android -R marc-mrt/carnet-releases -f ref=main
+# Never add a pull_request_target trigger: it would hand CARNET_READ_TOKEN and
+# the signing key to code from forks.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA of marc-mrt/carnet to build
+        required: false
+        default: main
+
+concurrency:
+  group: android
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: Build APK
+    # x86_64, like the Docker image the build script makes: nothing is emulated.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      REF: ${{ inputs.ref }}
+    steps:
+      # The source at the ref, in its own folder so the files this job writes
+      # never mix with it.
+      - uses: actions/checkout@v7
+        with:
+          repository: marc-mrt/carnet
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.CARNET_READ_TOKEN }}
+          path: carnet
+          persist-credentials: false
+
+      # Secrets reach the script only through env. An empty one fails here, by
+      # name, instead of as an obscure signing error twenty minutes in.
+      - name: Write the keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS; do
+            [ -n "${!name}" ] || { echo "::error::secret $name is empty or not set; see the maintainer section of the README"; exit 1; }
+          done
+          umask 077
+          KEYSTORE="$RUNNER_TEMP/carnet.keystore"
+          echo "KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+
+      - name: Build and sign
+        id: build
+        working-directory: carnet
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_VERSION_CODE: ${{ github.run_number }}
+        run: |
+          export ANDROID_KEYSTORE="$KEYSTORE"
+          sh scripts/android-build.sh release | tee "$RUNNER_TEMP/build.out"
+          apk=$(tail -n 1 "$RUNNER_TEMP/build.out")
+          [ -f "$apk" ] || { echo "::error::the build script's last line is not a file: $apk"; exit 1; }
+          cp "$apk" "$GITHUB_WORKSPACE/carnet-android-arm64.apk"
+
+      - name: Checksums and certificate digest
+        id: facts
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          sha256sum carnet-android-arm64.apk > SHA256SUMS
+          echo "sha=$(git -C carnet rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The certificate the APK was signed with, as users see it.
+          cert=$(keytool -list -v -keystore "$KEYSTORE" -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" | sed -n 's/^ *SHA256: *//p' | head -n 1)
+          [ -n "$cert" ] || { echo "::error::no certificate digest for the key alias"; exit 1; }
+          echo "cert=$cert" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: carnet-android-arm64.apk
+
+      # Created only now, so a failed build leaves no empty release behind. The
+      # tag carries the run number: a re-run never overwrites an earlier release.
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.facts.outputs.sha }}
+          CERT: ${{ steps.facts.outputs.cert }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          {
+            echo "Android arm64 build of marc-mrt/carnet at \`$REF\`."
+            echo
+            echo "- Source commit: \`$SHA\`"
+            echo "- versionCode: \`$VERSION_CODE\`"
+            echo "- Signing certificate SHA-256: \`$CERT\`"
+            echo
+            echo "Verify the download:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS"
+            echo "gh attestation verify carnet-android-arm64.apk -R $GITHUB_REPOSITORY"
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "android-$VERSION_CODE" carnet-android-arm64.apk SHA256SUMS -R "$GITHUB_REPOSITORY" --prerelease --title "Android $REF (${SHA:0:7})" --notes-file "$RUNNER_TEMP/notes.md"
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$KEYSTORE"
