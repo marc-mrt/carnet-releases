@@ -24,6 +24,8 @@ gh attestation verify carnet.flatpak -R marc-mrt/carnet-releases
 flatpak install --user carnet.flatpak
 ```
 
+If you used the old Poste app, run `flatpak uninstall io.github.marc_mrt.Poste` first, then re-add your accounts in Carnet, since no data carries over.
+
 ## Issues
 
 Bugs and ideas go in [issues](https://github.com/marc-mrt/carnet-releases/issues).

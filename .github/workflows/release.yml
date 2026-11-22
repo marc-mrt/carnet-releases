@@ -62,7 +62,7 @@ jobs:
       - name: Release notes
         run: |
           bash scripts/release/notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
-          bash scripts/release/metainfo-notes.sh "$TAG" "$(date -u +%F)" apps/client/flatpak/io.github.marc_mrt.Poste.metainfo.xml < "$RUNNER_TEMP/notes.md"
+          bash scripts/release/metainfo-notes.sh "$TAG" "$(date -u +%F)" apps/client/flatpak/io.github.marc_mrt.Carnet.metainfo.xml < "$RUNNER_TEMP/notes.md"
 
       - name: Build binary
         working-directory: apps/client
@@ -81,7 +81,7 @@ jobs:
           tool: tauri-driver
 
       - name: Start the built binary
-        run: POSTE_BINARY="$PWD/target/release/poste" bash tests/driver/run.sh
+        run: CARNET_BINARY="$PWD/target/release/carnet" bash tests/driver/run.sh
 
       - name: Install flatpak tooling
         run: |
@@ -89,12 +89,12 @@ jobs:
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Validate metainfo
-        run: appstreamcli validate --strict --no-net apps/client/flatpak/io.github.marc_mrt.Poste.metainfo.xml
+        run: appstreamcli validate --strict --no-net apps/client/flatpak/io.github.marc_mrt.Carnet.metainfo.xml
 
       - name: Build Flatpak bundle
         run: |
-          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir apps/client/flatpak/io.github.marc_mrt.Poste.yml
-          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo carnet.flatpak io.github.marc_mrt.Poste
+          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir apps/client/flatpak/io.github.marc_mrt.Carnet.yml
+          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo carnet.flatpak io.github.marc_mrt.Carnet
           sha256sum carnet.flatpak > SHA256SUMS
 
       - uses: actions/attest-build-provenance@v4
