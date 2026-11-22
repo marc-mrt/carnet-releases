@@ -24,6 +24,8 @@ gh attestation verify carnet.flatpak -R marc-mrt/carnet-releases
 flatpak install --user carnet.flatpak
 ```
 
+If you used the old Poste app, run `flatpak uninstall io.github.marc_mrt.Poste` first, then re-add your accounts in Carnet, since no data carries over.
+
 ## Android
 
 Android builds are made on demand from any branch, tag or commit of the source,
