@@ -1,16 +1,21 @@
 name: release
 
 # Builds Carnet (Flatpak and signed Android APK) from the private repository
-# marc-mrt/carnet at a tag and publishes both in one release here. Started by
-# hand only:
-#   gh workflow run release -R marc-mrt/carnet-releases -f tag=vX.Y.Z
+# marc-mrt/carnet at any ref and publishes both in one release here, at the
+# version given. The ref is a branch, tag or SHA and defaults to main; the
+# source's own version and tags are not checked. Started by hand only:
+#   gh workflow run release -R marc-mrt/carnet-releases -f version=X.Y.Z [-f ref=<branch|tag|sha>]
 # Never add a pull_request_target trigger: it would hand CARNET_READ_TOKEN to
 # code from forks.
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Tag of marc-mrt/carnet to build (vX.Y.Z)
+      ref:
+        description: Branch, tag or SHA of marc-mrt/carnet to build
+        required: false
+        default: main
+      version:
+        description: Version to release, SemVer MAJOR.MINOR.PATCH[-prerelease] (a leading v is dropped)
         required: true
 
 concurrency:
@@ -18,27 +23,92 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Validates the input and pins the commit before any build starts, so a bad
+  # version, an existing release or a missing ref fails in seconds, not after
+  # twenty minutes of builds.
+  resolve:
+    name: Resolve version and commit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      version: ${{ steps.facts.outputs.version }}
+      tag: ${{ steps.facts.outputs.tag }}
+      sha: ${{ steps.sha.outputs.sha }}
+      prev: ${{ steps.prev.outputs.prev }}
+      prerelease: ${{ steps.facts.outputs.prerelease }}
+    steps:
+      # Inputs reach the script only through env, never interpolated into it.
+      # The pattern is the one carnet's own set-version.sh enforces.
+      - name: Validate the version
+        id: facts
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          [[ "$version" =~ $semver ]] || { echo "::error::version is not SemVer MAJOR.MINOR.PATCH[-prerelease]"; exit 1; }
+          if gh release view "v$version" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release v$version already exists; it is never overwritten"
+            exit 1
+          fi
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      # A ref that does not exist fails here.
+      - uses: actions/checkout@v7
+        with:
+          repository: marc-mrt/carnet
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.CARNET_READ_TOKEN }}
+          path: carnet
+          persist-credentials: false
+
+      # Both builds check out this commit, so they match even if the ref moves.
+      - name: Pin the commit
+        id: sha
+        run: echo "sha=$(git -C carnet rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The source commit of the latest release, from its notes, so the next
+      # notes start there. Empty when there is none.
+      - name: Previous source commit
+        id: prev
+        run: |
+          body=$(gh release view -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+          prev=$(printf '%s\n' "$body" | tr -d '\r' | sed -nE 's|^Built from marc-mrt/carnet@([0-9a-f]{40})$|\1|p' | head -n 1)
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+
   flatpak:
     name: Build Flatpak
     # The binary is built on the host and must not need a newer glibc than the
     # org.gnome.Platform runtime; bump together with runtime-version.
     runs-on: ubuntu-24.04
+    needs: resolve
     permissions:
       contents: read
       id-token: write
       attestations: write
     env:
-      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PREV: ${{ needs.resolve.outputs.prev }}
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
-      # The source, at the tag, at the workspace root so its local actions
-      # and paths resolve. Full history: the notes need the previous tag.
+      # The source, at the pinned commit, at the workspace root so its local
+      # actions and paths resolve. Full history: the notes need the previous
+      # release.
       - uses: actions/checkout@v7
         with:
           repository: marc-mrt/carnet
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           token: ${{ secrets.CARNET_READ_TOKEN }}
           fetch-depth: 0
           persist-credentials: false
@@ -53,17 +123,24 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      # The repo carries the version; a mismatched tag fails rather than
-      # shipping a version no commit has.
-      - name: Check version matches tag
-        run: bash scripts/release/check-version.sh "$TAG"
+      # The binary and the metainfo must carry the release's version so the
+      # in-app update notice compares correctly.
+      - name: Stamp the version
+        run: bash scripts/set-version.sh "v$VERSION"
 
-      # Notes from the pull requests merged since the previous tag, for the
-      # release and for the metainfo's <release> entry the bundle ships.
+      # Notes from the pull requests merged since the previous release, for
+      # the release and for the metainfo's <release> entry the bundle ships.
+      # notes.sh starts from the nearest tag before the commit; a local tag at
+      # the previous release's source (never pushed) makes it start there
+      # instead, whatever carnet's own tags say. Without one it falls back to
+      # that nearest tag.
       - name: Release notes
         run: |
-          bash scripts/release/notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
-          bash scripts/release/metainfo-notes.sh "$TAG" "$(date -u +%F)" apps/client/flatpak/io.github.marc_mrt.Carnet.metainfo.xml < "$RUNNER_TEMP/notes.md"
+          if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
+            git tag previous-release "$PREV"
+          fi
+          bash scripts/release/notes.sh HEAD > "$RUNNER_TEMP/notes.md"
+          bash scripts/release/metainfo-notes.sh "$VERSION" "$(date -u +%F)" apps/client/flatpak/io.github.marc_mrt.Carnet.metainfo.xml < "$RUNNER_TEMP/notes.md"
 
       - name: Build binary
         working-directory: apps/client
@@ -117,29 +194,31 @@ jobs:
     name: Build APK
     # x86_64, like the Docker image the build script makes: nothing is emulated.
     runs-on: ubuntu-24.04
+    needs: resolve
     permissions:
       contents: read
       id-token: write
       attestations: write
     env:
-      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
     outputs:
       cert: ${{ steps.facts.outputs.cert }}
     steps:
-      # The source at the tag, in its own folder so the files this job writes
-      # never mix with it.
+      # The source at the pinned commit, in its own folder so the files this
+      # job writes never mix with it.
       - uses: actions/checkout@v7
         with:
           repository: marc-mrt/carnet
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
           token: ${{ secrets.CARNET_READ_TOKEN }}
           path: carnet
           persist-credentials: false
 
-      # No ANDROID_VERSION_CODE: the build derives it from the version, which
-      # this check pins to the tag.
-      - name: Check version matches tag
-        run: bash carnet/scripts/release/check-version.sh "$TAG"
+      # No ANDROID_VERSION_CODE: the build derives it from the version stamped
+      # here. The APK's version code must carry the release's version so the
+      # in-app update notice compares correctly.
+      - name: Stamp the version
+        run: bash carnet/scripts/set-version.sh "v$VERSION"
 
       # Secrets reach the script only through env. An empty one fails here, by
       # name, instead of as an obscure signing error twenty minutes in.
@@ -202,12 +281,14 @@ jobs:
   # release behind. It never overwrites: a tag whose release exists fails.
   publish:
     name: Publish release
-    needs: [flatpak, apk]
+    needs: [resolve, flatpak, apk]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
       CERT: ${{ needs.apk.outputs.cert }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -219,6 +300,7 @@ jobs:
       - name: Create the release
         working-directory: dist
         run: |
+          # Race guard: resolve checked this too, before the builds.
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "::error::release $TAG already exists; it is never overwritten"
             exit 1
@@ -226,6 +308,8 @@ jobs:
           sha256sum carnet.flatpak carnet-android-arm64.apk > SHA256SUMS
           {
             cat notes.md
+            echo
+            echo "Built from marc-mrt/carnet@$SHA"
             echo
             echo "## Android"
             echo
@@ -239,4 +323,7 @@ jobs:
             echo "gh attestation verify carnet-android-arm64.apk -R $GITHUB_REPOSITORY"
             echo '```'
           } > release-notes.md
-          gh release create "$TAG" carnet.flatpak carnet-android-arm64.apk SHA256SUMS -R "$GITHUB_REPOSITORY" --title "Carnet ${TAG#v}" --notes-file release-notes.md
+          # A prerelease is never "latest", so the in-app update notice skips it.
+          flags=()
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          gh release create "$TAG" carnet.flatpak carnet-android-arm64.apk SHA256SUMS -R "$GITHUB_REPOSITORY" --title "Carnet ${TAG#v}" --notes-file release-notes.md "${flags[@]}"
