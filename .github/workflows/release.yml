@@ -1,7 +1,8 @@
 name: release
 
-# Builds Carnet from the private repository marc-mrt/carnet at a tag and
-# publishes it here. Started by hand only:
+# Builds Carnet (Flatpak and signed Android APK) from the private repository
+# marc-mrt/carnet at a tag and publishes both in one release here. Started by
+# hand only:
 #   gh workflow run release -R marc-mrt/carnet-releases -f tag=vX.Y.Z
 # Never add a pull_request_target trigger: it would hand CARNET_READ_TOKEN to
 # code from forks.
@@ -23,7 +24,7 @@ jobs:
     # org.gnome.Platform runtime; bump together with runtime-version.
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     env:
@@ -95,14 +96,147 @@ jobs:
         run: |
           flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir apps/client/flatpak/io.github.marc_mrt.Carnet.yml
           flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo carnet.flatpak io.github.marc_mrt.Carnet
-          sha256sum carnet.flatpak > SHA256SUMS
 
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: carnet.flatpak
 
-      # Created only now, so a failed build leaves no empty release behind.
-      - name: Publish release
+      # Both files at the workspace root, so the artifact has no folders.
+      - name: Stage notes
+        run: cp "$RUNNER_TEMP/notes.md" notes.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flatpak
+          path: |
+            carnet.flatpak
+            notes.md
+          if-no-files-found: error
+
+  apk:
+    name: Build APK
+    # x86_64, like the Docker image the build script makes: nothing is emulated.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ inputs.tag }}
+    outputs:
+      cert: ${{ steps.facts.outputs.cert }}
+    steps:
+      # The source at the tag, in its own folder so the files this job writes
+      # never mix with it.
+      - uses: actions/checkout@v7
+        with:
+          repository: marc-mrt/carnet
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.CARNET_READ_TOKEN }}
+          path: carnet
+          persist-credentials: false
+
+      # No ANDROID_VERSION_CODE: the build derives it from the version, which
+      # this check pins to the tag.
+      - name: Check version matches tag
+        run: bash carnet/scripts/release/check-version.sh "$TAG"
+
+      # Secrets reach the script only through env. An empty one fails here, by
+      # name, instead of as an obscure signing error twenty minutes in.
+      - name: Write the keystore
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$TAG" carnet.flatpak SHA256SUMS -R "$GITHUB_REPOSITORY" --title "Carnet ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS; do
+            [ -n "${!name}" ] || { echo "::error::secret $name is empty or not set; see the maintainer section of the README"; exit 1; }
+          done
+          umask 077
+          KEYSTORE="$RUNNER_TEMP/carnet.keystore"
+          echo "KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+
+      # bash, not sh: pipefail makes a failing build script fail the step
+      # although its output goes through tee.
+      - name: Build and sign
+        working-directory: carnet
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -o pipefail
+          export ANDROID_KEYSTORE="$KEYSTORE"
+          sh scripts/android-build.sh release | tee "$RUNNER_TEMP/build.out"
+          apk=$(tail -n 1 "$RUNNER_TEMP/build.out")
+          [ -f "$apk" ] || { echo "::error::the build script's last line is not a file: $apk"; exit 1; }
+          cp "$apk" "$GITHUB_WORKSPACE/carnet-android-arm64.apk"
+
+      - name: Certificate digest
+        id: facts
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          # The certificate the APK was signed with, as users see it.
+          cert=$(keytool -list -v -keystore "$KEYSTORE" -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" | sed -n 's/^[[:space:]]*SHA256: *//p' | head -n 1)
+          [ -n "$cert" ] || { echo "::error::no certificate digest for the key alias"; exit 1; }
+          echo "cert=$cert" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: carnet-android-arm64.apk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apk
+          path: carnet-android-arm64.apk
+          if-no-files-found: error
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$KEYSTORE"
+
+  # Created only once both builds passed, so a failure leaves no partial
+  # release behind. It never overwrites: a tag whose release exists fails.
+  publish:
+    name: Publish release
+    needs: [flatpak, apk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+      CERT: ${{ needs.apk.outputs.cert }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        working-directory: dist
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release $TAG already exists; it is never overwritten"
+            exit 1
+          fi
+          sha256sum carnet.flatpak carnet-android-arm64.apk > SHA256SUMS
+          {
+            cat notes.md
+            echo
+            echo "## Android"
+            echo
+            echo "Signing certificate SHA-256: \`$CERT\`"
+            echo
+            echo "Verify the downloads:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS"
+            echo "gh attestation verify carnet.flatpak -R $GITHUB_REPOSITORY"
+            echo "gh attestation verify carnet-android-arm64.apk -R $GITHUB_REPOSITORY"
+            echo '```'
+          } > release-notes.md
+          gh release create "$TAG" carnet.flatpak carnet-android-arm64.apk SHA256SUMS -R "$GITHUB_REPOSITORY" --title "Carnet ${TAG#v}" --notes-file release-notes.md
